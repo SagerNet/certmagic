@@ -496,22 +496,72 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 		return Certificate{}, err
 	}
 
+	// Determine which SANs to include in the certificate
+	var certNames []string
+	if cfg.OnDemandMultiSAN != nil {
+		// Call the multi-SAN function to get additional domains
+		extraNames, err := cfg.OnDemandMultiSAN(ctx, name)
+		if err != nil {
+			log.Error("OnDemandMultiSAN function returned error",
+				zap.String("requested_name", name),
+				zap.Error(err))
+			// Fall back to single domain on error
+			certNames = []string{name}
+		} else if len(extraNames) > 0 {
+			// Validate all returned domains via DecisionFunc
+			if cfg.OnDemand != nil && cfg.OnDemand.DecisionFunc != nil {
+				var validatedNames []string
+				for _, n := range extraNames {
+					if err := cfg.OnDemand.DecisionFunc(ctx, n); err != nil {
+						log.Warn("OnDemandMultiSAN returned domain that failed DecisionFunc; skipping",
+							zap.String("domain", n),
+							zap.Error(err))
+						continue
+					}
+					validatedNames = append(validatedNames, n)
+				}
+				certNames = validatedNames
+			} else {
+				certNames = extraNames
+			}
+		} else {
+			// Empty result, use single domain
+			certNames = []string{name}
+		}
+	} else {
+		// No multi-SAN function configured, use single domain
+		certNames = []string{name}
+	}
+
+	// Ensure we have at least the requested name
+	if len(certNames) == 0 {
+		certNames = []string{name}
+	}
+
+	// Create a lock key based on all the names
+	var lockKey string
+	if len(certNames) == 1 {
+		lockKey = certNames[0]
+	} else {
+		lockKey = namesKey(certNames)
+	}
+
 	// We must protect this process from happening concurrently, so synchronize.
 	obtainCertWaitChansMu.Lock()
-	wait, ok := obtainCertWaitChans[name]
+	wait, ok := obtainCertWaitChans[lockKey]
 	if ok {
 		// lucky us -- another goroutine is already obtaining the certificate.
 		// wait for it to finish obtaining the cert and then we'll use it.
 		obtainCertWaitChansMu.Unlock()
 
 		log.Debug("new certificate is needed, but is already being obtained; waiting for that issuance to complete",
-			zap.String("subject", name))
+			zap.Strings("subjects", certNames))
 
 		// TODO: see if we can get a proper context in here, for true cancellation
 		timeout := time.NewTimer(2 * time.Minute)
 		select {
 		case <-timeout.C:
-			return Certificate{}, fmt.Errorf("timed out waiting to obtain certificate for %s", name)
+			return Certificate{}, fmt.Errorf("timed out waiting to obtain certificate for %v", certNames)
 		case <-wait:
 			timeout.Stop()
 		}
@@ -524,17 +574,17 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 	// looks like it's up to us to do all the work and obtain the cert.
 	// make a chan others can wait on if needed
 	wait = make(chan struct{})
-	obtainCertWaitChans[name] = wait
+	obtainCertWaitChans[lockKey] = wait
 	obtainCertWaitChansMu.Unlock()
 
 	unblockWaiters := func() {
 		obtainCertWaitChansMu.Lock()
 		close(wait)
-		delete(obtainCertWaitChans, name)
+		delete(obtainCertWaitChans, lockKey)
 		obtainCertWaitChansMu.Unlock()
 	}
 
-	log.Info("obtaining new certificate", zap.String("server_name", name))
+	log.Info("obtaining new certificate", zap.Strings("server_names", certNames))
 
 	// set a timeout so we don't inadvertently hold a client handshake open too long
 	// (timeout duration is based on https://caddy.community/t/zerossl-dns-challenge-failing-often-route53-plugin/13822/24?u=matt)
@@ -545,12 +595,21 @@ func (cfg *Config) obtainOnDemandCertificate(ctx context.Context, hello *tls.Cli
 	// obtain the certificate (this puts it in storage) and if successful,
 	// load it from storage so we and any other waiting goroutine can use it
 	var cert Certificate
-	err = cfg.ObtainCertAsync(ctx, name)
+	if len(certNames) == 1 {
+		// Single-SAN certificate
+		err = cfg.ObtainCertAsync(ctx, certNames[0])
+	} else {
+		// Multi-SAN certificate
+		err = cfg.ObtainCertAsyncMultiSAN(ctx, certNames)
+	}
+
 	if err == nil {
 		// load from storage while others wait to make the op as atomic as possible
 		cert, err = cfg.loadCertFromStorage(ctx, log, hello)
 		if err != nil {
-			log.Error("loading newly-obtained certificate from storage", zap.String("server_name", name), zap.Error(err))
+			log.Error("loading newly-obtained certificate from storage",
+				zap.Strings("server_names", certNames),
+				zap.Error(err))
 		}
 	}
 

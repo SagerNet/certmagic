@@ -89,6 +89,24 @@ type Config struct {
 	// TODO: Can we call this feature "Reactive/Lazy/Passive TLS" instead?
 	OnDemand *OnDemandConfig
 
+	// OnDemandMultiSAN optionally specifies additional SANs to include
+	// when obtaining a certificate on-demand. Given a requested domain,
+	// return additional domains to include on the same certificate.
+	// Return nil or empty slice to fall back to single-domain behavior.
+	// All returned domains must pass the OnDemand.DecisionFunc check.
+	//
+	// Example:
+	//   OnDemandMultiSAN: func(ctx context.Context, name string) ([]string, error) {
+	//       // Add www variant if not already present
+	//       if !strings.HasPrefix(name, "www.") {
+	//           return []string{name, "www." + name}, nil
+	//       }
+	//       return []string{name}, nil
+	//   }
+	//
+	// EXPERIMENTAL: Subject to change or removal.
+	OnDemandMultiSAN func(ctx context.Context, name string) ([]string, error)
+
 	// Adds the must staple TLS extension to the CSR.
 	MustStaple bool
 
@@ -342,6 +360,31 @@ func (cfg *Config) ManageAsync(ctx context.Context, domainNames []string) error 
 	return cfg.manageAll(ctx, domainNames, true)
 }
 
+// ManageSyncGrouped manages certificates with explicit grouping of SANs.
+// Each inner slice represents a single certificate with multiple SANs.
+// For example:
+//
+//	cfg.ManageSyncGrouped(ctx, [][]string{
+//	    {"example.com", "www.example.com", "api.example.com"},  // cert 1 with 3 SANs
+//	    {"other.com", "www.other.com"},                          // cert 2 with 2 SANs
+//	})
+//
+// This method validates that the configured SANs match any existing certificates
+// in storage. If a certificate already exists with a different set of SANs than
+// what is configured, an error is returned and the program should exit.
+// This is a synchronous method; see ManageAsyncGrouped for asynchronous variant.
+func (cfg *Config) ManageSyncGrouped(ctx context.Context, domainGroups [][]string) error {
+	return cfg.manageAllGrouped(ctx, domainGroups, false)
+}
+
+// ManageAsyncGrouped is the same as ManageSyncGrouped, except that ACME
+// operations are performed asynchronously (in the background).
+// This method returns before certificates are ready. It is crucial that
+// the administrator monitors the logs and is notified of any errors.
+func (cfg *Config) ManageAsyncGrouped(ctx context.Context, domainGroups [][]string) error {
+	return cfg.manageAllGrouped(ctx, domainGroups, true)
+}
+
 // ClientCredentials returns a list of TLS client certificate chains for the given identifiers.
 // The return value can be used in a tls.Config to enable client authentication using managed certificates.
 // Any certificates that need to be obtained or renewed for these identifiers will be managed accordingly.
@@ -385,6 +428,50 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 		// TODO: consider doing this in a goroutine if async, to utilize multiple cores while loading certs
 		// otherwise, begin management immediately
 		err := cfg.manageOne(ctx, domainName, async)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// manageAllGrouped manages certificates with explicit SAN grouping
+func (cfg *Config) manageAllGrouped(ctx context.Context, domainGroups [][]string, async bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cfg.OnDemand != nil && cfg.OnDemand.hostAllowlist == nil {
+		cfg.OnDemand.hostAllowlist = make(map[string]struct{})
+	}
+
+	for _, domainGroup := range domainGroups {
+		// Validate the SAN list
+		if err := validateSANList(domainGroup); err != nil {
+			return fmt.Errorf("invalid SAN group %v: %w", domainGroup, err)
+		}
+
+		// Normalize all domain names in the group
+		normalizedGroup := make([]string, len(domainGroup))
+		for i, name := range domainGroup {
+			normalizedGroup[i] = normalizedName(name)
+		}
+
+		// if on-demand is configured, add all names to allowlist and defer obtain/renew
+		if cfg.OnDemand != nil {
+			for _, name := range normalizedGroup {
+				cfg.OnDemand.hostAllowlist[name] = struct{}{}
+			}
+			continue
+		}
+
+		// Validate that configured SANs match existing certificate (if any)
+		if err := cfg.validateCertificateSANs(ctx, normalizedGroup); err != nil {
+			return err
+		}
+
+		// Manage this certificate group
+		err := cfg.manageOneGroup(ctx, normalizedGroup, async)
 		if err != nil {
 			return err
 		}
@@ -490,6 +577,100 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 	return renew()
 }
 
+// manageOneGroup manages a certificate for a group of SANs (multi-SAN certificate)
+func (cfg *Config) manageOneGroup(ctx context.Context, names []string, async bool) error {
+	if len(names) == 0 {
+		return fmt.Errorf("cannot manage certificate with empty SAN list")
+	}
+
+	// Generate a key for this SAN group for logging and job naming
+	groupKey := namesKey(names)
+	primaryName := names[0] // use first name for lookups and logging
+
+	// if certificate is already being managed, nothing to do; maintenance will continue
+	// Check if any of the names in this group have a managed cert
+	certs := cfg.certCache.getAllMatchingCerts(primaryName)
+	for _, cert := range certs {
+		if cert.managed && compareSANs(cert.Names, names) {
+			return nil
+		}
+	}
+
+	// first try loading existing certificate from storage by SAN group
+	cert, err := cfg.loadCertificateBySANGroup(ctx, names)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%v: caching certificate: %v", names, err)
+		}
+		// if we don't have one in storage, obtain one
+		obtain := func() error {
+			var err error
+			if async {
+				err = cfg.ObtainCertAsyncMultiSAN(ctx, names)
+			} else {
+				err = cfg.ObtainCertSyncMultiSAN(ctx, names)
+			}
+			if err != nil {
+				return fmt.Errorf("%v: obtaining certificate: %w", names, err)
+			}
+			cert, err = cfg.loadCertificateBySANGroup(ctx, names)
+			if err != nil {
+				return fmt.Errorf("%v: caching certificate after obtaining it: %v", names, err)
+			}
+			return nil
+		}
+		if async {
+			jm.Submit(cfg.Logger, "", obtain)
+			return nil
+		}
+		return obtain()
+	}
+
+	// for an existing certificate, make sure it is renewed; or if it is revoked,
+	// force a renewal even if it's not expiring
+	renew := func() error {
+		// first, ensure status is not revoked (it was just refreshed above)
+		if !cert.Expired() && cert.ocsp != nil && cert.ocsp.Status == ocsp.Revoked {
+			_, err = cfg.forceRenew(ctx, cfg.Logger, cert)
+			return err
+		}
+
+		// ensure ARI is updated before we check whether the cert needs renewing
+		if !cfg.DisableARI && cert.ari.NeedsRefresh() {
+			cert, _, err = cfg.updateARI(ctx, cert, cfg.Logger)
+			if err != nil {
+				cfg.Logger.Error("updating ARI upon managing", zap.Error(err))
+			}
+		}
+
+		// otherwise, simply renew the certificate if needed
+		if cert.NeedsRenewal(cfg) {
+			var err error
+			if async {
+				err = cfg.RenewCertAsyncMultiSAN(ctx, names, false)
+			} else {
+				err = cfg.RenewCertSyncMultiSAN(ctx, names, false)
+			}
+			if err != nil {
+				return fmt.Errorf("%v: renewing certificate: %w", names, err)
+			}
+			// successful renewal, so update in-memory cache
+			_, err = cfg.reloadManagedCertificate(ctx, cert)
+			if err != nil {
+				return fmt.Errorf("%v: reloading renewed certificate into memory: %v", names, err)
+			}
+		}
+
+		return nil
+	}
+
+	if async {
+		jm.Submit(cfg.Logger, "renew_"+groupKey, renew)
+		return nil
+	}
+	return renew()
+}
+
 // renewLockLease extends the lease duration on an existing lock if the storage
 // backend supports it. The lease duration is calculated based on the retry attempt
 // number and includes the certificate obtain timeout. This prevents locks from
@@ -530,6 +711,21 @@ func (cfg *Config) ObtainCertSync(ctx context.Context, name string) error {
 // background; i.e. non-interactively, and with retries if it fails.
 func (cfg *Config) ObtainCertAsync(ctx context.Context, name string) error {
 	return cfg.obtainCert(ctx, name, false)
+}
+
+// ObtainCertSyncMultiSAN generates a new private key and obtains a certificate
+// with multiple SANs using cfg in the foreground; i.e. interactively and without retries.
+// It stows the certificate and its assets in storage if successful.
+// It DOES NOT load the certificate into the in-memory cache. This method
+// is a no-op if storage already has a certificate for this SAN group.
+func (cfg *Config) ObtainCertSyncMultiSAN(ctx context.Context, names []string) error {
+	return cfg.obtainCertMultiSAN(ctx, names, true)
+}
+
+// ObtainCertAsyncMultiSAN is the same as ObtainCertSyncMultiSAN(), except it runs in the
+// background; i.e. non-interactively, and with retries if it fails.
+func (cfg *Config) ObtainCertAsyncMultiSAN(ctx context.Context, names []string) error {
+	return cfg.obtainCertMultiSAN(ctx, names, false)
 }
 
 func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool) error {
@@ -739,6 +935,218 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 	return err
 }
 
+// obtainCertMultiSAN is like obtainCert but for obtaining a certificate with multiple SANs
+func (cfg *Config) obtainCertMultiSAN(ctx context.Context, names []string, interactive bool) error {
+	if len(cfg.Issuers) == 0 {
+		return fmt.Errorf("no issuers configured; impossible to obtain or check for existing certificate in storage")
+	}
+
+	// Validate SAN list
+	if err := validateSANList(names); err != nil {
+		return fmt.Errorf("invalid SAN list: %w", err)
+	}
+
+	log := cfg.Logger.Named("obtain")
+
+	// Transform all subjects
+	transformedNames := make([]string, len(names))
+	for i, name := range names {
+		transformedNames[i] = cfg.transformSubject(ctx, log, name)
+	}
+	names = transformedNames
+
+	// Generate storage key for this SAN group
+	groupKey := namesKey(names)
+
+	// if storage has all resources for this certificate, obtain is a no-op
+	if cfg.storageHasCertResourcesAnyIssuerMultiSAN(ctx, names) {
+		return nil
+	}
+
+	// ensure storage is writeable and readable
+	err := cfg.checkStorage(ctx)
+	if err != nil {
+		return fmt.Errorf("failed storage check: %v - storage is probably misconfigured", err)
+	}
+
+	log.Info("acquiring lock", zap.Strings("identifiers", names))
+
+	// ensure idempotency of the obtain operation for this SAN group
+	lockKey := cfg.lockKey(certIssueLockOp, groupKey)
+	err = acquireLock(ctx, cfg.Storage, lockKey)
+	if err != nil {
+		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
+	}
+	defer func() {
+		log.Info("releasing lock", zap.Strings("identifiers", names))
+		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
+			log.Error("unable to unlock",
+				zap.Strings("identifiers", names),
+				zap.String("lock_key", lockKey),
+				zap.Error(err))
+		}
+	}()
+	log.Info("lock acquired", zap.Strings("identifiers", names))
+
+	f := func(ctx context.Context) error {
+		// renew lease on the lock if the certificate store supports it
+		attempt, ok := ctx.Value(AttemptsCtxKey).(*int)
+		if ok {
+			err = cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt)
+			if err != nil {
+				return fmt.Errorf("unable to renew lock lease '%s': %v", lockKey, err)
+			}
+		}
+
+		// check if obtain is still needed -- might have been obtained during lock
+		if cfg.storageHasCertResourcesAnyIssuerMultiSAN(ctx, names) {
+			log.Info("certificate already exists in storage", zap.Strings("identifiers", names))
+			return nil
+		}
+
+		log.Info("obtaining certificate", zap.Strings("identifiers", names))
+
+		if err := cfg.emit(ctx, "cert_obtaining", map[string]any{"identifiers": names}); err != nil {
+			return fmt.Errorf("obtaining certificate aborted by event handler: %w", err)
+		}
+
+		// If storage has a private key already, use it; otherwise we'll generate our own.
+		var privKey crypto.PrivateKey
+		var privKeyPEM []byte
+		var issuers []Issuer
+		if cfg.ReusePrivateKeys {
+			privKey, privKeyPEM, issuers, err = cfg.reusePrivateKeyMultiSAN(ctx, names)
+			if err != nil {
+				return err
+			}
+		} else {
+			issuers = make([]Issuer, len(cfg.Issuers))
+			copy(issuers, cfg.Issuers)
+		}
+		if cfg.IssuerPolicy == UseFirstRandomIssuer {
+			weakrand.Shuffle(len(issuers), func(i, j int) {
+				issuers[i], issuers[j] = issuers[j], issuers[i]
+			})
+		}
+		if privKey == nil {
+			privKey, err = cfg.KeySource.GenerateKey()
+			if err != nil {
+				return err
+			}
+			privKeyPEM, err = PEMEncodePrivateKey(privKey)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Generate CSR with all SANs
+		csr, err := cfg.generateCSR(privKey, names, false)
+		if err != nil {
+			return err
+		}
+
+		// try to obtain from each issuer until we succeed
+		var issuedCert *IssuedCertificate
+		var issuerUsed Issuer
+		var issuerKeys []string
+		for i, issuer := range issuers {
+			issuerKeys = append(issuerKeys, issuer.IssuerKey())
+
+			log.Debug(fmt.Sprintf("trying issuer %d/%d", i+1, len(cfg.Issuers)),
+				zap.String("issuer", issuer.IssuerKey()))
+
+			if prechecker, ok := issuer.(PreChecker); ok {
+				err = prechecker.PreCheck(ctx, names, interactive)
+				if err != nil {
+					continue
+				}
+			}
+
+			useCSR := csr
+			if issuer.IssuerKey() == zerosslIssuerKey {
+				useCSR, err = cfg.generateCSR(privKey, names, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			issuedCert, err = issuer.Issue(ctx, useCSR)
+			if err == nil {
+				issuerUsed = issuer
+				break
+			}
+
+			errToLog := err
+			var problem acme.Problem
+			if errors.As(err, &problem) {
+				errToLog = problem
+			}
+			log.Error("could not get certificate from issuer",
+				zap.Strings("identifiers", names),
+				zap.String("issuer", issuer.IssuerKey()),
+				zap.Error(errToLog))
+		}
+		if err != nil {
+			cfg.emit(ctx, "cert_failed", map[string]any{
+				"renewal":     false,
+				"identifiers": names,
+				"issuers":     issuerKeys,
+				"error":       err,
+			})
+
+			return fmt.Errorf("%v: Obtain: %w", names, err)
+		}
+		issuerKey := issuerUsed.IssuerKey()
+
+		// success - immediately save the certificate resource
+		metaJSON, err := json.Marshal(issuedCert.Metadata)
+		if err != nil {
+			log.Error("unable to encode certificate metadata", zap.Error(err))
+		}
+		certRes := CertificateResource{
+			SANs:           namesFromCSR(csr),
+			CertificatePEM: issuedCert.Certificate,
+			PrivateKeyPEM:  privKeyPEM,
+			IssuerData:     metaJSON,
+			issuerKey:      issuerUsed.IssuerKey(),
+		}
+		err = cfg.saveCertResource(ctx, issuerUsed, certRes)
+		if err != nil {
+			return fmt.Errorf("%v: Obtain: saving assets: %v", names, err)
+		}
+
+		log.Info("certificate obtained successfully",
+			zap.Strings("identifiers", names),
+			zap.String("issuer", issuerUsed.IssuerKey()))
+
+		certKey := certRes.NamesKey()
+
+		cfg.emit(ctx, "cert_obtained", map[string]any{
+			"renewal":          false,
+			"identifiers":      names,
+			"issuer":           issuerUsed.IssuerKey(),
+			"storage_path":     StorageKeys.CertsSitePrefix(issuerKey, certKey),
+			"private_key_path": StorageKeys.SitePrivateKey(issuerKey, certKey),
+			"certificate_path": StorageKeys.SiteCert(issuerKey, certKey),
+			"metadata_path":    StorageKeys.SiteMeta(issuerKey, certKey),
+			"csr_pem": pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE REQUEST",
+				Bytes: csr.Raw,
+			}),
+		})
+
+		return nil
+	}
+
+	if interactive {
+		err = f(ctx)
+	} else {
+		err = doWithRetry(ctx, log, f)
+	}
+
+	return err
+}
+
 // reusePrivateKey looks for a private key for domain in storage in the configured issuers
 // paths. For the first private key it finds, it returns that key both decoded and PEM-encoded,
 // as well as the reordered list of issuers to use instead of cfg.Issuers (because if a key
@@ -802,6 +1210,18 @@ func (cfg *Config) RenewCertSync(ctx context.Context, name string, force bool) e
 // background; i.e. non-interactively, and with retries if it fails.
 func (cfg *Config) RenewCertAsync(ctx context.Context, name string, force bool) error {
 	return cfg.renewCert(ctx, name, force, false)
+}
+
+// RenewCertSyncMultiSAN renews a certificate with multiple SANs using cfg in the foreground.
+// It stows the renewed certificate and its assets in storage if successful.
+func (cfg *Config) RenewCertSyncMultiSAN(ctx context.Context, names []string, force bool) error {
+	return cfg.renewCertMultiSAN(ctx, names, force, true)
+}
+
+// RenewCertAsyncMultiSAN is the same as RenewCertSyncMultiSAN(), except it runs in the
+// background; i.e. non-interactively, and with retries if it fails.
+func (cfg *Config) RenewCertAsyncMultiSAN(ctx context.Context, names []string, force bool) error {
+	return cfg.renewCertMultiSAN(ctx, names, force, false)
 }
 
 func (cfg *Config) renewCert(ctx context.Context, name string, force, interactive bool) error {
@@ -1029,6 +1449,230 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 	}
 
 	return err
+}
+
+// renewCertMultiSAN renews a certificate with multiple SANs
+func (cfg *Config) renewCertMultiSAN(ctx context.Context, names []string, force, interactive bool) error {
+	if len(cfg.Issuers) == 0 {
+		return fmt.Errorf("no issuers configured; impossible to renew or check existing certificate in storage")
+	}
+
+	// Validate SAN list
+	if err := validateSANList(names); err != nil {
+		return fmt.Errorf("invalid SAN list: %w", err)
+	}
+
+	log := cfg.Logger.Named("renew")
+
+	// Transform all subjects
+	transformedNames := make([]string, len(names))
+	for i, name := range names {
+		transformedNames[i] = cfg.transformSubject(ctx, log, name)
+	}
+	names = transformedNames
+
+	groupKey := namesKey(names)
+
+	// ensure storage is writeable and readable
+	err := cfg.checkStorage(ctx)
+	if err != nil {
+		return fmt.Errorf("failed storage check: %v - storage is probably misconfigured", err)
+	}
+
+	log.Info("acquiring lock", zap.Strings("identifiers", names))
+
+	// ensure idempotency of the renew operation for this SAN group
+	lockKey := cfg.lockKey(certIssueLockOp, groupKey)
+	err = acquireLock(ctx, cfg.Storage, lockKey)
+	if err != nil {
+		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
+	}
+	defer func() {
+		log.Info("releasing lock", zap.Strings("identifiers", names))
+
+		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
+			log.Error("unable to unlock",
+				zap.Strings("identifiers", names),
+				zap.String("lock_key", lockKey),
+				zap.Error(err))
+		}
+	}()
+	log.Info("lock acquired", zap.Strings("identifiers", names))
+
+	f := func(ctx context.Context) error {
+		// renew lease on the lock if supported
+		attempt, ok := ctx.Value(AttemptsCtxKey).(*int)
+		if ok {
+			err = cfg.renewLockLease(ctx, cfg.Storage, lockKey, *attempt)
+			if err != nil {
+				return fmt.Errorf("unable to renew lock lease '%s': %v", lockKey, err)
+			}
+		}
+
+		// Load existing certificate resource
+		certRes, err := cfg.loadCertResourceMultiSANAnyIssuer(ctx, names)
+		if err != nil {
+			return fmt.Errorf("loading certificate resource for renewal: %w", err)
+		}
+
+		// Parse the leaf certificate to get expiry info
+		certChain, err := parseCertsFromPEMBundle(certRes.CertificatePEM)
+		if err != nil || len(certChain) == 0 {
+			return fmt.Errorf("parsing existing certificate: %w", err)
+		}
+		leaf := certChain[0]
+
+		timeLeft := expiresAt(leaf).Sub(time.Now().UTC())
+		log.Info("renewing certificate", zap.Strings("identifiers", names), zap.Duration("remaining", timeLeft))
+
+		privateKey, err := PEMDecodePrivateKey(certRes.PrivateKeyPEM)
+		if err != nil {
+			return err
+		}
+
+		// Get the list of issuers to try
+		issuers := make([]Issuer, len(cfg.Issuers))
+		copy(issuers, cfg.Issuers)
+
+		if cfg.IssuerPolicy == UseFirstRandomIssuer {
+			weakrand.Shuffle(len(issuers), func(i, j int) {
+				issuers[i], issuers[j] = issuers[j], issuers[i]
+			})
+		}
+
+		// Generate CSR with all SANs
+		csr, err := cfg.generateCSR(privateKey, names, false)
+		if err != nil {
+			return err
+		}
+
+		// Try to renew from each issuer
+		var issuedCert *IssuedCertificate
+		var issuerUsed Issuer
+		var issuerKeys []string
+		for i, issuer := range issuers {
+			issuerKeys = append(issuerKeys, issuer.IssuerKey())
+
+			log.Debug(fmt.Sprintf("trying issuer %d/%d", i+1, len(issuers)),
+				zap.String("issuer", issuer.IssuerKey()))
+
+			if prechecker, ok := issuer.(PreChecker); ok {
+				err = prechecker.PreCheck(ctx, names, interactive)
+				if err != nil {
+					continue
+				}
+			}
+
+			useCSR := csr
+			if issuer.IssuerKey() == zerosslIssuerKey {
+				useCSR, err = cfg.generateCSR(privateKey, names, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			// For ACME, include ARI replacement info if applicable
+			if !cfg.DisableARI {
+				if acmeData, err := certRes.getACMEData(); err == nil && acmeData.CA != "" {
+					if acmeIss, ok := issuer.(*ACMEIssuer); ok {
+						if acmeIss.CA == acmeData.CA {
+							ctx = context.WithValue(ctx, ctxKeyARIReplaces, leaf)
+						}
+					}
+				}
+			}
+
+			issuedCert, err = issuer.Issue(ctx, useCSR)
+			if err == nil {
+				issuerUsed = issuer
+				break
+			}
+
+			errToLog := err
+			var problem acme.Problem
+			if errors.As(err, &problem) {
+				errToLog = problem
+			}
+			log.Error("could not get certificate from issuer",
+				zap.Strings("identifiers", names),
+				zap.String("issuer", issuer.IssuerKey()),
+				zap.Error(errToLog))
+		}
+		if err != nil {
+			cfg.emit(ctx, "cert_failed", map[string]any{
+				"renewal":     true,
+				"identifiers": names,
+				"remaining":   timeLeft,
+				"issuers":     issuerKeys,
+				"error":       err,
+			})
+
+			return fmt.Errorf("%v: Renew: %w", names, err)
+		}
+		issuerKey := issuerUsed.IssuerKey()
+
+		// Save the renewed certificate
+		metaJSON, err := json.Marshal(issuedCert.Metadata)
+		if err != nil {
+			log.Error("unable to encode certificate metadata", zap.Error(err))
+		}
+		newCertRes := CertificateResource{
+			SANs:           namesFromCSR(csr),
+			CertificatePEM: issuedCert.Certificate,
+			PrivateKeyPEM:  certRes.PrivateKeyPEM,
+			IssuerData:     metaJSON,
+			issuerKey:      issuerKey,
+		}
+		err = cfg.saveCertResource(ctx, issuerUsed, newCertRes)
+		if err != nil {
+			return fmt.Errorf("%v: Renew: saving assets: %v", names, err)
+		}
+
+		log.Info("certificate renewed successfully",
+			zap.Strings("identifiers", names),
+			zap.String("issuer", issuerKey))
+
+		certKey := newCertRes.NamesKey()
+
+		cfg.emit(ctx, "cert_obtained", map[string]any{
+			"renewal":          true,
+			"remaining":        timeLeft,
+			"identifiers":      names,
+			"issuer":           issuerKey,
+			"storage_path":     StorageKeys.CertsSitePrefix(issuerKey, certKey),
+			"private_key_path": StorageKeys.SitePrivateKey(issuerKey, certKey),
+			"certificate_path": StorageKeys.SiteCert(issuerKey, certKey),
+			"metadata_path":    StorageKeys.SiteMeta(issuerKey, certKey),
+			"csr_pem": pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE REQUEST",
+				Bytes: csr.Raw,
+			}),
+		})
+
+		return nil
+	}
+
+	if interactive {
+		err = f(ctx)
+	} else {
+		err = doWithRetry(ctx, log, f)
+	}
+
+	return err
+}
+
+// loadCertResourceMultiSANAnyIssuer loads certificate resource for multi-SAN cert from any issuer
+func (cfg *Config) loadCertResourceMultiSANAnyIssuer(ctx context.Context, names []string) (CertificateResource, error) {
+	for _, issuer := range cfg.Issuers {
+		certRes, err := cfg.loadCertResourceMultiSAN(ctx, issuer, names)
+		if err == nil {
+			return certRes, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return CertificateResource{}, err
+		}
+	}
+	return CertificateResource{}, fs.ErrNotExist
 }
 
 // generateCSR generates a CSR for the given SANs. If useCN is true, CommonName will get the first SAN (TODO: this is only a temporary hack for ZeroSSL API support).
@@ -1326,6 +1970,171 @@ func (cfg *Config) managedCertNeedsRenewal(certRes CertificateResource, emitLogs
 	}
 	remaining := time.Until(expiresAt(certChain[0]))
 	return remaining, certChain[0], cfg.certNeedsRenewal(certChain[0], ari, emitLogs)
+}
+
+// validateCertificateSANs validates that the configured SANs match any existing
+// certificate in storage. Returns an error if a certificate exists with different SANs.
+func (cfg *Config) validateCertificateSANs(ctx context.Context, names []string) error {
+	// Try to load existing certificate for this SAN group
+	cert, err := cfg.loadCertificateBySANGroup(ctx, names)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// No existing certificate, validation passes
+			return nil
+		}
+		// Some other error occurred during load
+		return fmt.Errorf("error checking existing certificate: %w", err)
+	}
+
+	// Certificate exists, compare SANs
+	if !compareSANs(cert.Names, names) {
+		return fmt.Errorf("certificate SAN mismatch: configured %v but certificate has %v - "+
+			"cannot modify SANs on existing certificate; please obtain a new certificate or update configuration",
+			names, cert.Names)
+	}
+
+	return nil
+}
+
+// loadCertificateBySANGroup loads a certificate from storage that matches the given SAN group
+func (cfg *Config) loadCertificateBySANGroup(ctx context.Context, names []string) (Certificate, error) {
+	groupKey := namesKey(names)
+
+	// Try to load from each configured issuer
+	for _, issuer := range cfg.Issuers {
+		certRes, err := cfg.loadCertResourceMultiSAN(ctx, issuer, names)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return Certificate{}, err
+		}
+
+		// Successfully loaded, parse and cache it
+		cert, err := cfg.makeCertificateWithOCSP(ctx, certRes.CertificatePEM, certRes.PrivateKeyPEM)
+		if err != nil {
+			return Certificate{}, err
+		}
+
+		// Set managed flag and issuer key
+		cert.managed = true
+		cert.issuerKey = certRes.issuerKey
+		if ari, err := certRes.getARI(); err == nil && ari != nil {
+			cert.ari = *ari
+		}
+
+		// Cache it
+		cfg.certCache.cacheCertificate(cert)
+
+		cfg.Logger.Info("certificate loaded from storage",
+			zap.Strings("identifiers", names),
+			zap.String("issuer", issuer.IssuerKey()),
+			zap.String("storage_key", groupKey))
+
+		return cert, nil
+	}
+
+	return Certificate{}, fs.ErrNotExist
+}
+
+// loadCertResourceMultiSAN loads a certificate resource for a multi-SAN certificate
+func (cfg *Config) loadCertResourceMultiSAN(ctx context.Context, issuer Issuer, names []string) (CertificateResource, error) {
+	groupKey := namesKey(names)
+	issuerKey := issuer.IssuerKey()
+
+	certRes := CertificateResource{
+		SANs:      names,
+		issuerKey: issuerKey,
+	}
+
+	certPath := StorageKeys.SiteCert(issuerKey, groupKey)
+	certPEM, err := cfg.Storage.Load(ctx, certPath)
+	if err != nil {
+		return CertificateResource{}, err
+	}
+	certRes.CertificatePEM = certPEM
+
+	keyPath := StorageKeys.SitePrivateKey(issuerKey, groupKey)
+	keyPEM, err := cfg.Storage.Load(ctx, keyPath)
+	if err != nil {
+		return CertificateResource{}, err
+	}
+	certRes.PrivateKeyPEM = keyPEM
+
+	metaPath := StorageKeys.SiteMeta(issuerKey, groupKey)
+	metaBytes, err := cfg.Storage.Load(ctx, metaPath)
+	if err != nil {
+		return CertificateResource{}, err
+	}
+	certRes.IssuerData = metaBytes
+
+	return certRes, nil
+}
+
+// storageHasCertResourcesAnyIssuerMultiSAN returns true if storage has all the
+// certificate resources for a multi-SAN certificate from any configured issuer.
+func (cfg *Config) storageHasCertResourcesAnyIssuerMultiSAN(ctx context.Context, names []string) bool {
+	for _, iss := range cfg.Issuers {
+		if cfg.storageHasCertResourcesMultiSAN(ctx, iss, names) {
+			return true
+		}
+	}
+	return false
+}
+
+// storageHasCertResourcesMultiSAN returns true if storage has all resources for a multi-SAN cert
+func (cfg *Config) storageHasCertResourcesMultiSAN(ctx context.Context, issuer Issuer, names []string) bool {
+	groupKey := namesKey(names)
+	issuerKey := issuer.IssuerKey()
+
+	certPath := StorageKeys.SiteCert(issuerKey, groupKey)
+	if !cfg.Storage.Exists(ctx, certPath) {
+		return false
+	}
+
+	keyPath := StorageKeys.SitePrivateKey(issuerKey, groupKey)
+	if !cfg.Storage.Exists(ctx, keyPath) {
+		return false
+	}
+
+	metaPath := StorageKeys.SiteMeta(issuerKey, groupKey)
+	if !cfg.Storage.Exists(ctx, metaPath) {
+		return false
+	}
+
+	return true
+}
+
+// reusePrivateKeyMultiSAN looks for a private key for a SAN group in storage
+func (cfg *Config) reusePrivateKeyMultiSAN(ctx context.Context, names []string) (privKey crypto.PrivateKey, privKeyPEM []byte, issuers []Issuer, err error) {
+	groupKey := namesKey(names)
+
+	// make a copy of cfg.Issuers
+	issuers = make([]Issuer, len(cfg.Issuers))
+	copy(issuers, cfg.Issuers)
+
+	for i, issuer := range issuers {
+		privateKeyStorageKey := StorageKeys.SitePrivateKey(issuer.IssuerKey(), groupKey)
+		privKeyPEM, err = cfg.Storage.Load(ctx, privateKeyStorageKey)
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+			continue
+		}
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("loading existing private key for reuse with issuer %s: %v", issuer.IssuerKey(), err)
+		}
+
+		privKey, err = PEMDecodePrivateKey(privKeyPEM)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		// Move this issuer to the front
+		issuers = append([]Issuer{issuer}, append(issuers[:i], issuers[i+1:]...)...)
+		break
+	}
+
+	return
 }
 
 func (cfg *Config) emit(ctx context.Context, eventName string, data map[string]any) error {

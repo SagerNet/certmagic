@@ -154,3 +154,297 @@ func mustJSON(val any) []byte {
 	}
 	return result
 }
+
+// Test SAN utility functions
+
+func TestCompareSANs(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        []string
+		b        []string
+		expected bool
+	}{
+		{
+			name:     "identical lists",
+			a:        []string{"example.com", "www.example.com"},
+			b:        []string{"example.com", "www.example.com"},
+			expected: true,
+		},
+		{
+			name:     "same elements, different order",
+			a:        []string{"www.example.com", "example.com"},
+			b:        []string{"example.com", "www.example.com"},
+			expected: true,
+		},
+		{
+			name:     "case insensitive",
+			a:        []string{"Example.COM", "WWW.example.com"},
+			b:        []string{"example.com", "www.EXAMPLE.com"},
+			expected: true,
+		},
+		{
+			name:     "different lengths",
+			a:        []string{"example.com"},
+			b:        []string{"example.com", "www.example.com"},
+			expected: false,
+		},
+		{
+			name:     "different domains",
+			a:        []string{"example.com", "api.example.com"},
+			b:        []string{"example.com", "www.example.com"},
+			expected: false,
+		},
+		{
+			name:     "empty lists",
+			a:        []string{},
+			b:        []string{},
+			expected: true,
+		},
+		{
+			name:     "one empty list",
+			a:        []string{"example.com"},
+			b:        []string{},
+			expected: false,
+		},
+		{
+			name:     "with whitespace",
+			a:        []string{" example.com ", "www.example.com"},
+			b:        []string{"example.com", " www.example.com "},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := compareSANs(tt.a, tt.b)
+			if result != tt.expected {
+				t.Errorf("compareSANs(%v, %v) = %v, want %v", tt.a, tt.b, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidateSANList(t *testing.T) {
+	tests := []struct {
+		name      string
+		sans      []string
+		expectErr bool
+		errMsg    string
+	}{
+		{
+			name:      "valid single SAN",
+			sans:      []string{"example.com"},
+			expectErr: false,
+		},
+		{
+			name:      "valid multiple SANs",
+			sans:      []string{"example.com", "www.example.com", "api.example.com"},
+			expectErr: false,
+		},
+		{
+			name:      "empty list",
+			sans:      []string{},
+			expectErr: true,
+			errMsg:    "SAN list cannot be empty",
+		},
+		{
+			name:      "duplicate SANs",
+			sans:      []string{"example.com", "example.com"},
+			expectErr: true,
+			errMsg:    "duplicate name",
+		},
+		{
+			name:      "duplicate SANs case insensitive",
+			sans:      []string{"example.com", "EXAMPLE.COM"},
+			expectErr: true,
+			errMsg:    "duplicate name",
+		},
+		{
+			name:      "too many SANs",
+			sans:      make([]string, 101),
+			expectErr: true,
+			errMsg:    "SAN list too large",
+		},
+		{
+			name:      "empty name in list",
+			sans:      []string{"example.com", "", "www.example.com"},
+			expectErr: true,
+			errMsg:    "empty name",
+		},
+		{
+			name:      "exactly 100 SANs",
+			sans:      make([]string, 100),
+			expectErr: false,
+		},
+	}
+
+	// Initialize the test case with 100 unique SANs
+	for i := range tests[len(tests)-1].sans {
+		tests[len(tests)-1].sans[i] = "domain" + string(rune('0'+i%10)) + string(rune('a'+i/10)) + ".com"
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSANList(tt.sans)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("validateSANList() expected error containing %q, got nil", tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("validateSANList() unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNamesKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		sans     []string
+		expected string
+	}{
+		{
+			name:     "single SAN",
+			sans:     []string{"example.com"},
+			expected: "example.com",
+		},
+		{
+			name:     "multiple SANs sorted",
+			sans:     []string{"example.com", "www.example.com"},
+			expected: "example.com,www.example.com",
+		},
+		{
+			name:     "multiple SANs unsorted",
+			sans:     []string{"www.example.com", "api.example.com", "example.com"},
+			expected: "api.example.com,example.com,www.example.com",
+		},
+		{
+			name:     "empty list",
+			sans:     []string{},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := namesKey(tt.sans)
+			if result != tt.expected {
+				t.Errorf("namesKey(%v) = %q, want %q", tt.sans, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSaveCertResourceMultiSAN(t *testing.T) {
+	ctx := context.Background()
+
+	am := &ACMEIssuer{CA: "https://example.com/acme/directory"}
+	testConfig := &Config{
+		Issuers:   []Issuer{am},
+		Storage:   &FileStorage{Path: "./_testdata_tmp_multisan"},
+		Logger:    defaultTestLogger,
+		certCache: new(Cache),
+	}
+	am.config = testConfig
+
+	testStorageDir := testConfig.Storage.(*FileStorage).Path
+	defer func() {
+		err := os.RemoveAll(testStorageDir)
+		if err != nil {
+			t.Fatalf("Could not remove temporary storage directory (%s): %v", testStorageDir, err)
+		}
+	}()
+
+	domains := []string{"example.com", "www.example.com", "api.example.com"}
+	certContents := "certificate"
+	keyContents := "private key"
+
+	cert := CertificateResource{
+		SANs:           domains,
+		PrivateKeyPEM:  []byte(keyContents),
+		CertificatePEM: []byte(certContents),
+		IssuerData: mustJSON(acme.Certificate{
+			URL: "https://example.com/cert",
+		}),
+		issuerKey: am.IssuerKey(),
+	}
+
+	err := testConfig.saveCertResource(ctx, am, cert)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	// Load using the multi-SAN function
+	loadedCert, err := testConfig.loadCertResourceMultiSAN(ctx, am, domains)
+	if err != nil {
+		t.Fatalf("Expected no error reading multi-SAN cert, got: %v", err)
+	}
+
+	// Normalize JSON for comparison
+	loadedCert.IssuerData = bytes.ReplaceAll(loadedCert.IssuerData, []byte("\t"), []byte(""))
+	loadedCert.IssuerData = bytes.ReplaceAll(loadedCert.IssuerData, []byte("\n"), []byte(""))
+	loadedCert.IssuerData = bytes.ReplaceAll(loadedCert.IssuerData, []byte(" "), []byte(""))
+
+	if !reflect.DeepEqual(cert.SANs, loadedCert.SANs) {
+		t.Errorf("Expected SANs %v to match %v", cert.SANs, loadedCert.SANs)
+	}
+	if !bytes.Equal(cert.CertificatePEM, loadedCert.CertificatePEM) {
+		t.Errorf("Certificate PEM does not match")
+	}
+	if !bytes.Equal(cert.PrivateKeyPEM, loadedCert.PrivateKeyPEM) {
+		t.Errorf("Private key PEM does not match")
+	}
+}
+
+func TestStorageHasCertResourcesMultiSAN(t *testing.T) {
+	ctx := context.Background()
+
+	am := &ACMEIssuer{CA: "https://example.com/acme/directory"}
+	testConfig := &Config{
+		Issuers:   []Issuer{am},
+		Storage:   &FileStorage{Path: "./_testdata_tmp_multisan_check"},
+		Logger:    defaultTestLogger,
+		certCache: new(Cache),
+	}
+	am.config = testConfig
+
+	testStorageDir := testConfig.Storage.(*FileStorage).Path
+	defer func() {
+		os.RemoveAll(testStorageDir)
+	}()
+
+	domains := []string{"example.com", "www.example.com"}
+
+	// Should not exist initially
+	exists := testConfig.storageHasCertResourcesMultiSAN(ctx, am, domains)
+	if exists {
+		t.Error("Expected cert to not exist, but it does")
+	}
+
+	// Save a cert
+	cert := CertificateResource{
+		SANs:           domains,
+		PrivateKeyPEM:  []byte("key"),
+		CertificatePEM: []byte("cert"),
+		IssuerData:     mustJSON(acme.Certificate{URL: "https://example.com/cert"}),
+		issuerKey:      am.IssuerKey(),
+	}
+	err := testConfig.saveCertResource(ctx, am, cert)
+	if err != nil {
+		t.Fatalf("Error saving cert: %v", err)
+	}
+
+	// Should exist now
+	exists = testConfig.storageHasCertResourcesMultiSAN(ctx, am, domains)
+	if !exists {
+		t.Error("Expected cert to exist, but it doesn't")
+	}
+
+	// Check with any issuer function
+	existsAny := testConfig.storageHasCertResourcesAnyIssuerMultiSAN(ctx, domains)
+	if !existsAny {
+		t.Error("Expected cert to exist for any issuer, but it doesn't")
+	}
+}

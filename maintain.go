@@ -234,20 +234,35 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 		zap.Strings("identifiers", oldCert.Names),
 		zap.Duration("remaining", timeLeft))
 
-	// Get the name which we should use to renew this certificate;
-	// we only support managing certificates with one name per cert,
-	// so this should be easy.
-	renewName := oldCert.Names[0]
+	// Get all the names from this certificate for renewal.
+	// For single-SAN certificates, use the original single-name API.
+	// For multi-SAN certificates, use the new multi-SAN API.
+	certNames := oldCert.Names
+	var jobName string
+	if len(certNames) == 1 {
+		jobName = "renew_" + certNames[0]
+	} else {
+		// For multi-SAN certs, create a job name from the sorted names
+		jobName = "renew_" + namesKey(certNames)
+	}
 
 	// queue up this renewal job (is a no-op if already active or queued)
-	jm.Submit(cfg.Logger, "renew_"+renewName, func() error {
+	jm.Submit(cfg.Logger, jobName, func() error {
 		timeLeft := expiresAt(oldCert.Leaf).Sub(time.Now().UTC())
 		log.Info("attempting certificate renewal",
 			zap.Strings("identifiers", oldCert.Names),
 			zap.Duration("remaining", timeLeft))
 
 		// perform renewal - crucially, this happens OUTSIDE a lock on certCache
-		err := cfg.RenewCertAsync(ctx, renewName, false)
+		var err error
+		if len(certNames) == 1 {
+			// Single-SAN certificate: use original API
+			err = cfg.RenewCertAsync(ctx, certNames[0], false)
+		} else {
+			// Multi-SAN certificate: use new multi-SAN API
+			err = cfg.RenewCertAsyncMultiSAN(ctx, certNames, false)
+		}
+
 		if err != nil {
 			if cfg.OnDemand != nil {
 				// loaded dynamically, remove dynamically

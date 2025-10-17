@@ -432,6 +432,78 @@ func (cr *CertificateResource) NamesKey() string {
 	return result
 }
 
+// compareSANs compares two SAN lists in an order-independent, case-insensitive manner.
+// Returns true if both lists contain the same set of SANs.
+func compareSANs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Normalize and sort both lists
+	aNorm := make([]string, len(a))
+	bNorm := make([]string, len(b))
+
+	for i := range a {
+		aNorm[i] = strings.ToLower(strings.TrimSpace(a[i]))
+	}
+	for i := range b {
+		bNorm[i] = strings.ToLower(strings.TrimSpace(b[i]))
+	}
+
+	sort.Strings(aNorm)
+	sort.Strings(bNorm)
+
+	for i := range aNorm {
+		if aNorm[i] != bNorm[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// validateSANList validates a list of SANs for use in certificate requests.
+// It checks for: at least one name, no duplicates (case-insensitive), and
+// reasonable count (ACME providers typically limit to ~100 SANs).
+func validateSANList(names []string) error {
+	if len(names) == 0 {
+		return fmt.Errorf("SAN list cannot be empty")
+	}
+
+	if len(names) > 100 {
+		return fmt.Errorf("SAN list too large (%d names); most ACME providers limit certificates to ~100 SANs", len(names))
+	}
+
+	// Check for duplicates (case-insensitive)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		normalized := strings.ToLower(strings.TrimSpace(name))
+		if normalized == "" {
+			return fmt.Errorf("SAN list contains empty name")
+		}
+		if _, exists := seen[normalized]; exists {
+			return fmt.Errorf("SAN list contains duplicate name: %s", name)
+		}
+		seen[normalized] = struct{}{}
+	}
+
+	return nil
+}
+
+// namesKey generates a storage key from a list of SANs, similar to
+// CertificateResource.NamesKey() but as a standalone function.
+func namesKey(names []string) string {
+	sorted := make([]string, len(names))
+	copy(sorted, names)
+	sort.Strings(sorted)
+	result := strings.Join(sorted, ",")
+	if len(result) > 1024 {
+		const trunc = "_trunc"
+		result = result[:1024-len(trunc)] + trunc
+	}
+	return result
+}
+
 // Default contains the package defaults for the
 // various Config fields. This is used as a template
 // when creating your own Configs with New() or
