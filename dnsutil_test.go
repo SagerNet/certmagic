@@ -183,7 +183,7 @@ func TestFindZoneByFqdn(t *testing.T) {
 }
 
 func TestResolveConfServers(t *testing.T) {
-	var testCases = []struct {
+	testCases := []struct {
 		fixture  string
 		expected []string
 		defaults []string
@@ -244,7 +244,6 @@ func TestRecursiveNameserversAddsPort(t *testing.T) {
 	if !hasCustom {
 		t.Errorf("%v Expected custom resolvers to be included, but they weren't: %v", results, custom)
 	}
-
 }
 
 func TestRecursiveNameserversDefaults(t *testing.T) {

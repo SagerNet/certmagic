@@ -310,8 +310,10 @@ func releaseLock(ctx context.Context, storage Storage, lockKey string) error {
 
 // locks stores a reference to all the current
 // locks obtained by this process.
-var locks = make(map[string]Storage)
-var locksMu sync.Mutex
+var (
+	locks   = make(map[string]Storage)
+	locksMu sync.Mutex
+)
 
 // StorageKeys provides methods for accessing
 // keys and key prefixes for items in a Storage.

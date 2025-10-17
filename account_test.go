@@ -47,6 +47,7 @@ func (m *memoryStorage) lookup(_ context.Context, key string) *memoryStorageItem
 	}
 	return nil
 }
+
 func (m *memoryStorage) Delete(ctx context.Context, key string) error {
 	for i, item := range m.contents {
 		if item.key == key {
@@ -56,13 +57,16 @@ func (m *memoryStorage) Delete(ctx context.Context, key string) error {
 	}
 	return fs.ErrNotExist
 }
+
 func (m *memoryStorage) Store(ctx context.Context, key string, value []byte) error {
 	m.contents = append(m.contents, memoryStorageItem{key: key, data: value})
 	return nil
 }
+
 func (m *memoryStorage) Exists(ctx context.Context, key string) bool {
 	return m.lookup(ctx, key) != nil
 }
+
 func (m *memoryStorage) List(ctx context.Context, path string, recursive bool) ([]string, error) {
 	if recursive {
 		panic("unimplemented")
@@ -88,12 +92,14 @@ nextitem:
 	}
 	return result, nil
 }
+
 func (m *memoryStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	if item := m.lookup(ctx, key); item != nil {
 		return item.data, nil
 	}
 	return nil, fs.ErrNotExist
 }
+
 func (m *memoryStorage) Stat(ctx context.Context, key string) (KeyInfo, error) {
 	if item := m.lookup(ctx, key); item != nil {
 		return KeyInfo{Key: key, Size: int64(len(item.data))}, nil
@@ -114,30 +120,37 @@ func (r *recordingStorage) Delete(ctx context.Context, key string) error {
 	r.record("Delete", key)
 	return r.Storage.Delete(ctx, key)
 }
+
 func (r *recordingStorage) Exists(ctx context.Context, key string) bool {
 	r.record("Exists", key)
 	return r.Storage.Exists(ctx, key)
 }
+
 func (r *recordingStorage) List(ctx context.Context, path string, recursive bool) ([]string, error) {
 	r.record("List", path, recursive)
 	return r.Storage.List(ctx, path, recursive)
 }
+
 func (r *recordingStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	r.record("Load", key)
 	return r.Storage.Load(ctx, key)
 }
+
 func (r *recordingStorage) Lock(ctx context.Context, name string) error {
 	r.record("Lock", name)
 	return r.Storage.Lock(ctx, name)
 }
+
 func (r *recordingStorage) Stat(ctx context.Context, key string) (KeyInfo, error) {
 	r.record("Stat", key)
 	return r.Storage.Stat(ctx, key)
 }
+
 func (r *recordingStorage) Store(ctx context.Context, key string, value []byte) error {
 	r.record("Store", key)
 	return r.Storage.Store(ctx, key, value)
 }
+
 func (r *recordingStorage) Unlock(ctx context.Context, name string) error {
 	r.record("Unlock", name)
 	return r.Storage.Unlock(ctx, name)

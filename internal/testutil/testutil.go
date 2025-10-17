@@ -21,11 +21,13 @@ func AssertEqual(t *testing.T, a, b any, msgAndArgs ...string) {
 			"actual  : %v", a, b), msgAndArgs...)
 	}
 }
+
 func RequireNoError(t *testing.T, err error, msgAndArgs ...string) {
 	if err != nil {
 		Failnow(t, fmt.Sprintf("Received unexpected error:\n%+v", err), msgAndArgs...)
 	}
 }
+
 func RequireError(t *testing.T, err error, msgAndArgs ...string) {
 	if err == nil {
 		Failnow(t, fmt.Sprintf("Received no error when expecting error:\n%+v", err), msgAndArgs...)
@@ -39,6 +41,7 @@ func RequireEqual(t *testing.T, a, b any, msgAndArgs ...string) {
 			"actual  : %v", a, b), msgAndArgs...)
 	}
 }
+
 func RequireEqualValues(t *testing.T, a, b any, msgAndArgs ...string) {
 	if !ObjectsAreEqualValues(a, b) {
 		Failnow(t, fmt.Sprintf("Not equal: \n"+

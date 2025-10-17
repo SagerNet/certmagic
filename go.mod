@@ -1,4 +1,4 @@
-module github.com/caddyserver/certmagic
+module github.com/sagernet/certmagic
 
 go 1.23.0
 

@@ -27,7 +27,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/caddyserver/certmagic/internal/atomicfile"
+	"github.com/sagernet/certmagic/internal/atomicfile"
 )
 
 // FileStorage facilitates forming file paths derived from a root
@@ -79,7 +79,7 @@ func (s *FileStorage) Exists(_ context.Context, key string) bool {
 // Store saves value at key.
 func (s *FileStorage) Store(_ context.Context, key string, value []byte) error {
 	filename := s.Filename(key)
-	err := os.MkdirAll(filepath.Dir(filename), 0700)
+	err := os.MkdirAll(filepath.Dir(filename), 0o700)
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func keepLockfileFresh(filename string) {
 // with the current timestamp. It returns true if the parent
 // loop can terminate (i.e. no more need to update the lock).
 func updateLockfileFreshness(filename string) (bool, error) {
-	f, err := os.OpenFile(filename, os.O_RDWR, 0644)
+	f, err := os.OpenFile(filename, os.O_RDWR, 0o644)
 	if os.IsNotExist(err) {
 		return true, nil // lock released
 	}
@@ -376,8 +376,8 @@ func updateLockfileFreshness(filename string) (bool, error) {
 // identified by filename if it doesn't already exist.
 func atomicallyCreateFile(filename string, writeLockInfo bool) error {
 	// no need to check this error, we only really care about the file creation error
-	_ = os.MkdirAll(filepath.Dir(filename), 0700)
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	_ = os.MkdirAll(filepath.Dir(filename), 0o700)
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
