@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/certmagic/internal/testutil"
+	"github.com/sagernet/certmagic/internal/testutil"
 	"github.com/mholt/acmez/v3/acme"
 )
 
