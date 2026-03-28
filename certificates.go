@@ -651,6 +651,9 @@ func isInternalIP(addr string) bool {
 func hostOnly(hostport string) string {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
+		if len(hostport) > 2 && hostport[0] == '[' && hostport[len(hostport)-1] == ']' {
+			return hostport[1 : len(hostport)-1]
+		}
 		return hostport // OK; probably had no port to begin with
 	}
 	return host
