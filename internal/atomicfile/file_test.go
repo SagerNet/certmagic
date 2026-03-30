@@ -22,8 +22,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/caddyserver/certmagic/internal/atomicfile"
-	"github.com/caddyserver/certmagic/internal/testutil"
+	"github.com/sagernet/certmagic/internal/atomicfile"
+	"github.com/sagernet/certmagic/internal/testutil"
 )
 
 func TestFile(t *testing.T) {
